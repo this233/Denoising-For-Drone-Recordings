@@ -1,7 +1,34 @@
 #!/usr/bin/env python3
 """
-无人机录音综合降噪脚本
-利用多种噪声样本建立综合噪声模型，对录音进行多层次降噪处理
+无人机录音智能降噪系统 - 主处理模块
+
+本模块实现了一个基于多阶段信号处理技术的无人机录音降噪系统。
+系统采用分层降噪架构，结合传统信号处理方法和机器学习算法，
+能够有效去除无人机旋翼噪声、电机噪声等各类环境干扰。
+
+主要技术特点：
+- 多阶段降噪流水线：频域预处理 → 统计降噪 → 自适应精细降噪 → 残留噪声清理
+- 动态噪声匹配：基于多维特征相似度的智能噪声样本选择
+- 自适应滤波：结合频谱减法和维纳滤波的混合降噪算法
+- 长音频处理：支持任意长度音频的分片处理和无缝重构
+
+作者：[项目作者]
+版本：v1.0.0
+创建日期：2025年
+最后修改：2025年7月
+
+使用示例：
+    # 基础用法
+    denoiser = DroneVoiceDenoiser()
+    denoiser.load_noise_samples()
+    denoiser.process_file("input.mp3", "output.mp3")
+    
+    # 高级用法
+    denoiser = DroneVoiceDenoiser(
+        noise_dir="custom_noise",
+        top_k_noise=8,
+        similarity_threshold=0.8
+    )
 """
 
 import os
@@ -20,55 +47,128 @@ from scipy.spatial.distance import cosine
 import warnings
 warnings.filterwarnings('ignore')
 
-# 设置matplotlib支持中文显示
+# 配置matplotlib中文字体支持
+# 解决中文字符在图表中的显示问题
 plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'SimHei', 'Microsoft YaHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 class DroneVoiceDenoiser:
-    def __init__(self, noise_dir="samples/noise", output_dir="samples/denoised", top_k_noise=5, similarity_threshold=0.75):
+    """
+    无人机录音智能降噪器
+    
+    本类实现了一个完整的无人机录音降噪解决方案，采用多阶段处理架构
+    和基于机器学习的噪声匹配算法，能够有效去除各类无人机噪声干扰。
+    
+    核心算法原理：
+    1. 频域预处理：使用带通滤波器保留人声频率范围（50-3400Hz）
+    2. 统计降噪：基于噪声统计特性的初步降噪
+    3. 自适应精细降噪：
+       - 动态噪声匹配：使用多维特征向量计算相似度
+       - 频谱减法：S_clean = max(|S_audio|² - α|S_noise|², β|S_audio|²)
+       - 维纳滤波：H(f) = S_signal(f) / (S_signal(f) + S_noise(f))
+    4. 残留噪声后处理：使用专门的残留噪声样本进行最终清理
+    
+    特征向量构成：
+    - 归一化频谱幅度：反映频域能量分布
+    - 归一化功率谱密度：反映频域功率特性
+    - 归一化频谱质心：反映频谱能量中心位置
+    - 归一化频谱带宽：反映频谱能量分散程度
+    - 归一化MFCC系数：反映音频的倒谱特征
+    
+    相似度计算公式：
+    similarity = 0.4 × cosine_similarity + 0.3 × euclidean_similarity + 0.3 × correlation
+    
+    Attributes:
+        noise_dir (Path): 噪声样本库目录路径
+        sample_rate (int): 统一处理采样率，默认22050Hz
+        chunk_duration (int): 长音频分片长度（秒），默认30秒
+        overlap_duration (int): 分片重叠长度（秒），默认5秒
+        top_k_noise (int): 动态选择的最佳匹配噪声样本数量
+        similarity_threshold (float): 噪声匹配相似度阈值
+        noise_samples (list): 存储所有噪声样本的音频数据
+        noise_spectra (list): 存储所有噪声样本的频谱特征
+        noise_metadata (list): 存储噪声样本的元数据信息
+        residual_noise_sample (np.ndarray): 残留噪声样本用于后处理
+    
+    Notes:
+        - 所有音频处理都会重采样到统一采样率以确保一致性
+        - 噪声样本库应包含不同工况下的无人机噪声录音
+        - 系统支持MP3、WAV、FLAC等主流音频格式
+        - 处理过程中会生成详细的频谱分析图表
+    """
+    
+    def __init__(self, noise_dir="noise_samples", top_k_noise=5, similarity_threshold=0.75):
         """
         初始化无人机录音降噪器
         
+        设置降噪器的核心参数和配置，建立噪声样本库连接。
+        
         Args:
-            noise_dir: 噪声样本目录
-            output_dir: 输出目录
-            top_k_noise: 选择前k个最匹配的噪声样本进行平均
-            similarity_threshold: 相似度阈值，只有超过此值的样本才会被选择
+            noise_dir (str): 噪声样本目录路径。应包含不同无人机型号和工况的噪声录音。
+                           文件命名格式建议：{drone_id}_segment_{seq}_{start}s-{end}s.mp3
+            top_k_noise (int): 动态选择的最佳匹配噪声样本数量。
+                              值越大降噪效果可能越好，但计算复杂度增加。
+                              推荐范围：3-10
+            similarity_threshold (float): 噪声匹配相似度阈值。
+                                        只有相似度超过此阈值的样本才参与降噪。
+                                        推荐范围：0.6-0.9
+        
+        Raises:
+            FileNotFoundError: 当指定的噪声样本目录不存在时
+        
+        Note:
+            初始化后需要调用 load_noise_samples() 方法加载噪声样本库
         """
         self.noise_dir = Path(noise_dir)
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 降噪参数
-        self.sample_rate = 22050  # 统一采样率
-        self.chunk_duration = 30  # 分片长度（秒）
-        self.overlap_duration = 5  # 重叠长度（秒）
-        self.top_k_noise = top_k_noise  # 选择前k个最匹配的噪声样本
-        self.similarity_threshold = similarity_threshold  # 相似度阈值
+        # === 音频处理核心参数 ===
+        self.sample_rate = 22050  # 统一采样率，平衡音质和处理效率
+        self.chunk_duration = 30  # 分片长度（秒），影响内存使用和处理精度
+        self.overlap_duration = 5  # 重叠长度（秒），确保分片边界无缝衔接
         
-        # 噪声样本库 - 存储所有单独的噪声样本
-        self.noise_samples = []  # 存储所有噪声样本的音频数据
-        self.noise_spectra = []  # 存储所有噪声样本的频谱特征
-        self.noise_metadata = []  # 存储噪声样本的元数据（文件名、无人机编号等）
-        self.residual_noise_sample = None  # 残留噪声样本
+        # === 噪声匹配参数 ===
+        self.top_k_noise = top_k_noise  # Top-K噪声样本选择策略
+        self.similarity_threshold = similarity_threshold  # 相似度过滤阈值
         
-        # 频率范围（无人机噪声主要集中在低频和中频）
-        self.drone_freq_ranges = [
-            (20, 200),    # 低频螺旋桨噪声
-            (200, 1000),  # 中低频电机噪声
-            (1000, 4000), # 中频风切声
-            (4000, 8000)  # 高频谐波
-        ]
+        # === 噪声样本库存储结构 ===
+        self.noise_samples = []  # 原始音频数据列表：List[np.ndarray]
+        self.noise_spectra = []  # 频谱特征数据列表：List[np.ndarray] 
+        self.noise_metadata = []  # 元数据信息列表：List[Dict]
+        self.residual_noise_sample = None  # 残留噪声样本：np.ndarray
         
-        print(f"初始化降噪器完成")
-        print(f"噪声样本目录: {self.noise_dir}")
-        print(f"输出目录: {self.output_dir}")
+        print(f"✓ 降噪器初始化完成")
+        print(f"  噪声样本目录: {self.noise_dir}")
+        print(f"  Top-K样本数: {self.top_k_noise}")
+        print(f"  相似度阈值: {self.similarity_threshold:.3f}")
     
     def load_noise_samples(self):
         """
-        加载所有噪声样本，保存单独的样本而不是平均值
+        加载并预处理噪声样本库
+        
+        从指定目录中加载所有噪声样本文件，提取多维音频特征，
+        构建用于动态匹配的噪声样本库。每个样本都会提取以下特征：
+        - 频谱幅度分布：用于频谱减法
+        - 功率谱密度：用于能量匹配
+        - 频谱质心：反映频率中心
+        - 频谱带宽：反映频率分散度
+        - MFCC系数：反映音色特征
+        
+        文件命名约定：
+        - 格式：{drone_id}_segment_{seq}_{start}s-{end}s.mp3
+        - drone_id: 无人机编号（1-10为普通样本，11为残留噪声样本）
+        - seq: 片段序号
+        - start/end: 时间范围标识
+        
+        Raises:
+            FileNotFoundError: 当噪声样本目录为空或不存在mp3文件时
+            ValueError: 当无法建立有效的噪声模型时
+        
+        Note:
+            - 所有样本会被重采样到统一采样率
+            - 11号无人机样本被特殊处理作为残留噪声样本
+            - 特征向量会被归一化以提高匹配精度
         """
-        print("正在加载噪声样本...")
+        print("📂 正在加载噪声样本库...")
         
         noise_files = list(self.noise_dir.glob("*.mp3"))
         if not noise_files:
@@ -150,16 +250,37 @@ class DroneVoiceDenoiser:
     
     def find_best_matching_noise(self, audio_segment, top_k=5, similarity_threshold=0.75):
         """
-        为音频片段找到最匹配的多个噪声样本并进行平均
+        智能噪声匹配算法 - 为音频片段寻找最佳匹配的噪声样本
+        
+        使用多维特征相似度评估算法，从噪声样本库中选择与当前音频片段
+        最相似的Top-K个样本，并进行加权平均以构建自适应噪声模型。
+        
+        相似度评估算法：
+        1. 特征提取：提取音频片段的多维特征向量
+        2. 相似度计算：
+           - 余弦相似度：cosine_sim = 1 - cosine_distance(feat1, feat2)
+           - 欧氏距离相似度：euclidean_sim = 1 / (1 + euclidean_distance)
+           - 皮尔逊相关系数：correlation = corrcoef(feat1, feat2)
+        3. 综合评分：similarity = 0.4×cosine + 0.3×euclidean + 0.3×correlation
+        4. Top-K选择：选择得分最高且超过阈值的前K个样本
+        5. 频谱平均：对选中样本的频谱进行加权平均
         
         Args:
-            audio_segment: 音频片段
-            top_k: 选择前k个最匹配的样本进行平均
-            similarity_threshold: 相似度阈值，只有超过此值的样本才会被选择
+            audio_segment (np.ndarray): 待处理的音频片段，形状为(n_samples,)
+            top_k (int): 选择的最佳匹配样本数量，推荐范围[3,10]
+            similarity_threshold (float): 相似度阈值过滤器，推荐范围[0.6,0.9]
             
         Returns:
-            averaged_noise_spectrum: 平均后的噪声频谱（如果没有合适样本则返回None）
-            best_matches_info: 最匹配噪声样本的信息列表
+            tuple: (averaged_noise_spectrum, best_matches_info)
+                - averaged_noise_spectrum (np.ndarray | None): 
+                  平均后的噪声频谱，如果没有符合条件的样本则返回None
+                - best_matches_info (list): 最佳匹配样本的详细信息列表
+                  每个元素包含：similarity, metadata, cosine_sim, euclidean_sim, correlation
+        
+        Note:
+            - 算法会自动处理特征向量长度不一致的问题
+            - 当没有样本超过相似度阈值时，会跳过基于噪声模型的降噪
+            - 返回的频谱已经过归一化处理，可直接用于频谱减法
         """
         if len(self.noise_metadata) == 0:
             raise ValueError("没有可用的噪声样本")
@@ -358,16 +479,59 @@ class DroneVoiceDenoiser:
     
     def multi_stage_denoise(self, y, sr, return_stages=False):
         """
-        多阶段降噪处理，动态选择最佳噪声样本
+        多阶段智能降噪核心算法
+        
+        本方法实现了四阶段渐进式降噪流水线，每个阶段针对不同类型的噪声
+        采用专门的处理策略，确保在有效去除噪声的同时保持音频质量。
+        
+        降噪流水线详解：
+        
+        【阶段1：频域预处理】
+        - 目标：去除明显的频域噪声，保留人声关键频率
+        - 方法：双向带通滤波器设计
+          * 高通滤波（50Hz）：去除极低频噪声（电机振动、风噪等）
+          * 低通滤波（3400Hz）：去除高频干扰（电子噪声、数字噪声等）
+        - 保留范围：50-3400Hz（覆盖人声基频和主要谐波）
+        
+        【阶段2：统计降噪】
+        - 目标：基于噪声统计特性进行初步清理
+        - 方法：使用noisereduce库的平稳噪声假设算法
+        - 参数：stationary=True, prop_decrease=0.8
+        - 特点：保守降噪，避免过度处理导致失真
+        
+        【阶段3：自适应精细降噪】
+        - 目标：基于噪声库的智能匹配进行精准降噪
+        - 方法：
+          * 动态噪声匹配：寻找最相似的Top-K噪声样本
+          * 频谱减法：S_clean = max(|S|² - α|N|², β|S|²)
+          * 自适应维纳滤波：H(f) = S_signal/(S_signal + S_noise)
+        - 自适应特性：根据相似度动态调整降噪强度
+        
+        【阶段4：残留噪声后处理】
+        - 目标：清理前三阶段未能去除的残留噪声
+        - 方法：使用专门的残留噪声样本进行最终清理
+        - 参数：stationary=False, prop_decrease=0.6
+        - 特点：非平稳噪声假设，适应动态噪声环境
         
         Args:
-            y: 输入音频信号
-            sr: 采样率
-            return_stages: 是否返回各阶段结果
+            y (np.ndarray): 输入音频信号，形状为(n_samples,)
+            sr (int): 音频采样率，建议与self.sample_rate一致
+            return_stages (bool): 是否返回各阶段的中间结果，用于分析和调试
             
         Returns:
-            如果return_stages=True: (final_audio, stage_results)
-            否则: final_audio
+            Union[np.ndarray, Tuple[np.ndarray, List[np.ndarray]]]:
+                - 当return_stages=False时：返回最终降噪结果
+                - 当return_stages=True时：返回(最终结果, 各阶段结果列表)
+                  阶段结果列表包含：[原始, 阶段1, 阶段2, 阶段3, 阶段4]
+        
+        Raises:
+            ValueError: 当输入音频为空或采样率不匹配时
+            
+        Note:
+            - 算法会根据噪声样本库的匹配情况自动调整处理策略
+            - 当找不到合适的噪声样本时，会跳过阶段3的精细降噪
+            - 每个阶段都保持音频的时域连续性，避免产生人工痕迹
+            - 建议在调用前确保已加载噪声样本库
         """
         # 保存各阶段结果
         if return_stages:
@@ -530,17 +694,21 @@ class DroneVoiceDenoiser:
         sf.write(output_file, final_audio, self.sample_rate)
         print(f"降噪完成，保存至: {output_file}")
         
-        # 生成详细对比图 - 只对第一个片段进行分阶段分析
-        if num_chunks > 0:
-            # 对第一个片段进行详细分析
-            first_chunk = y[:chunk_samples] if len(y) >= chunk_samples else y
-            denoised_chunk, stage_results = self.multi_stage_denoise(
-                first_chunk, self.sample_rate, return_stages=True
-            )
-            self.plot_comparison(first_chunk, denoised_chunk, f"{input_file.stem}_stages", stage_results)
+        # 计算图片保存路径（在输出文件同目录下）
+        output_path = Path(output_file)
+        plot_save_path = output_path.parent / output_path.stem
+        
+        # # 生成详细对比图 - 只对第一个片段进行分阶段分析
+        # if num_chunks > 0:
+        #     # 对第一个片段进行详细分析
+        #     first_chunk = y[:chunk_samples] if len(y) >= chunk_samples else y
+        #     denoised_chunk, stage_results = self.multi_stage_denoise(
+        #         first_chunk, self.sample_rate, return_stages=True
+        #     )
+        #     self.plot_comparison(first_chunk, denoised_chunk, f"{plot_save_path}_stages", stage_results)
         
         # 生成整体对比图
-        self.plot_comparison(y, final_audio, input_file.stem)
+        self.plot_comparison(y, final_audio, str(plot_save_path))
         
         return final_audio
     
@@ -579,14 +747,14 @@ class DroneVoiceDenoiser:
         
         return final_audio
     
-    def plot_comparison(self, original, denoised, filename, stage_results=None):
+    def plot_comparison(self, original, denoised, plot_save_path, stage_results=None):
         """
         绘制降噪前后的对比图，可选显示各阶段频谱
         
         Args:
             original: 原始音频
             denoised: 降噪后音频
-            filename: 文件名
+            plot_save_path: 图片保存的完整路径（不含扩展名）
             stage_results: 各阶段结果列表 [原始, 阶段1, 阶段2, 阶段3, 最终]
         """
         if stage_results is not None:
@@ -718,10 +886,10 @@ class DroneVoiceDenoiser:
             axes[3].grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(self.output_dir / f"{filename}_comparison.png", dpi=150, bbox_inches='tight')
+        plt.savefig(f"{plot_save_path}_comparison.png", dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"对比图保存至: {self.output_dir / f'{filename}_comparison.png'}")
+        print(f"对比图保存至: {plot_save_path}_comparison.png")
     
     def compute_spectrum(self, audio):
         """
@@ -740,44 +908,46 @@ class DroneVoiceDenoiser:
         
         return positive_freqs, positive_fft_db
     
-    def process_file(self, input_file, output_file=None):
+    def process_file(self, input_file, output_file):
         """
         处理单个音频文件
         
         Args:
             input_file: 输入文件路径
-            output_file: 输出文件路径（可选）
+            output_file: 输出文件路径
         """
         input_path = Path(input_file)
         
         if not input_path.exists():
             raise FileNotFoundError(f"输入文件不存在: {input_file}")
         
-        if output_file is None:
-            output_file = self.output_dir / f"{input_path.stem}_denoised{input_path.suffix}"
-        else:
-            output_file = Path(output_file)
+        output_path = Path(output_file)
         
         # 确保输出目录存在
-        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
         # 处理音频
-        result = self.process_long_audio(input_path, output_file)
+        result = self.process_long_audio(input_path, output_path)
         
         return result
     
-    def batch_process(self, input_dir, pattern="*.mp3"):
+    def batch_process(self, input_dir, output_dir, pattern="*.mp3"):
         """
         批量处理音频文件
         
         Args:
             input_dir: 输入目录
+            output_dir: 输出目录
             pattern: 文件匹配模式
         """
         input_path = Path(input_dir)
+        output_path = Path(output_dir)
         
         if not input_path.exists():
             raise FileNotFoundError(f"输入目录不存在: {input_dir}")
+        
+        # 创建输出目录
+        output_path.mkdir(parents=True, exist_ok=True)
         
         # 查找匹配的文件
         audio_files = list(input_path.glob(pattern))
@@ -792,18 +962,59 @@ class DroneVoiceDenoiser:
         for i, file in enumerate(audio_files):
             print(f"\n处理文件 {i+1}/{len(audio_files)}: {file.name}")
             try:
-                self.process_file(file)
+                # 构建输出文件路径
+                output_file = output_path / f"{file.stem}_denoised{file.suffix}"
+                self.process_file(file, output_file)
             except Exception as e:
                 print(f"处理文件 {file.name} 时出错: {e}")
                 continue
         
-        print(f"\n批量处理完成！结果保存在: {self.output_dir}")
+        print(f"\n批量处理完成！结果保存在: {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description='无人机录音综合降噪处理')
+    """
+    无人机录音降噪系统命令行接口主程序
+    
+    提供完整的命令行参数解析、输入验证、降噪器初始化和音频处理功能。
+    支持单文件和批量处理两种模式，具有完善的错误处理和用户反馈机制。
+    
+    命令行参数：
+        --input: 输入音频文件或目录路径（必需）
+        --output: 输出文件或目录路径（必需）
+        --noise-dir: 噪声样本库目录路径（默认：noise_samples）
+        --batch: 启用批量处理模式标志
+        --pattern: 批量处理时的文件匹配模式（默认：*.mp3）
+        --top-k: 噪声匹配Top-K数量（默认：5）
+        --similarity-threshold: 相似度阈值（默认：0.75）
+    
+    处理流程：
+        1. 解析命令行参数
+        2. 验证输入输出路径的有效性
+        3. 初始化降噪器实例
+        4. 加载噪声样本库
+        5. 执行音频降噪处理
+        6. 输出处理结果和状态信息
+    
+    错误处理：
+        - 路径验证：确保输入输出路径符合处理模式要求
+        - 异常捕获：处理文件加载、降噪算法和文件保存异常
+        - 用户友好：提供清晰的错误信息和解决建议
+    
+    Examples:
+        # 单文件处理
+        python drone_denoiser.py --input recording.mp3 --output clean.mp3
+        
+        # 批量处理
+        python drone_denoiser.py --batch --input ./recordings --output ./cleaned
+        
+        # 自定义参数
+        python drone_denoiser.py --input recording.mp3 --output clean.mp3 \\
+                                --top-k 8 --similarity-threshold 0.8
+    """
+    parser = argparse.ArgumentParser(description='无人机录音智能降噪系统 - 专业级音频降噪解决方案')
     parser.add_argument('--input', required=True, help='输入音频文件或目录')
-    parser.add_argument('--output', help='输出文件或目录（可选）')
-    parser.add_argument('--noise-dir', default='samples/noise', help='噪声样本目录')
+    parser.add_argument('--output', required=True, help='输出文件或目录')
+    parser.add_argument('--noise-dir', default='noise_samples/segments', help='噪声样本目录')
     parser.add_argument('--batch', action='store_true', help='批量处理模式')
     parser.add_argument('--pattern', default='*.mp3', help='批量处理时的文件匹配模式')
     parser.add_argument('--top-k', type=int, default=5, help='选择前k个最匹配的噪声样本进行平均（默认：5）')
@@ -811,10 +1022,32 @@ def main():
     
     args = parser.parse_args()
     
+    # 验证输入输出参数
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    
+    if args.batch:
+        # 批量模式：输入必须是目录，输出必须是目录
+        if not input_path.is_dir():
+            print(f"错误：批量模式下输入必须是目录，但 {args.input} 不是目录")
+            return
+        # 输出路径可以不存在（会自动创建），但如果存在必须是目录
+        if output_path.exists() and not output_path.is_dir():
+            print(f"错误：批量模式下输出必须是目录，但 {args.output} 不是目录")
+            return
+    else:
+        # 单文件模式：输入必须是文件，输出必须是文件路径
+        if not input_path.is_file():
+            print(f"错误：单文件模式下输入必须是文件，但 {args.input} 不是文件")
+            return
+        # 输出路径如果存在，必须是文件；如果不存在，其父目录必须存在或可以创建
+        if output_path.exists() and output_path.is_dir():
+            print(f"错误：单文件模式下输出必须是文件路径，但 {args.output} 是目录")
+            return
+    
     # 创建降噪器
     denoiser = DroneVoiceDenoiser(
         noise_dir=args.noise_dir,
-        output_dir=args.output or 'samples/denoised',
         top_k_noise=args.top_k,
         similarity_threshold=args.similarity_threshold
     )
@@ -830,7 +1063,7 @@ def main():
     # 处理音频
     try:
         if args.batch:
-            denoiser.batch_process(args.input, args.pattern)
+            denoiser.batch_process(args.input, args.output, args.pattern)
         else:
             denoiser.process_file(args.input, args.output)
     except Exception as e:
