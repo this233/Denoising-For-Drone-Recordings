@@ -62,7 +62,7 @@
 
 ```bash
 # 1. 进入项目
-cd drone_noise_reduce
+cd Denoising-For-Drone-Recordings
 
 # 2. 创建虚拟环境
 conda create -p ./env python=3.10 -y
