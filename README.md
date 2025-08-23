@@ -83,6 +83,7 @@ matplotlib>=3.4.0      # 数据可视化
 seaborn>=0.11.0        # 统计图表绘制
 noisereduce>=2.0.0     # 统计降噪算法
 scikit-learn>=1.0.0    # 机器学习算法
+pyaudio>=0.2.13        # 实时音频流采集
 ```
 
 ## 📚 使用指南
@@ -126,19 +127,46 @@ python extract_drone_noise.py \
     --output noise_samples/segments
 ```
 
+#### 4. 实时音频流（麦克风）
+
+```bash
+python drone_denoiser.py \
+    --stream \
+    --output ./denoised/stream_denoised.wav \
+    --stream-rate 44100 \
+    --chunk-size 2048 \
+    --stream-seconds 60
+```
+
+等价的 PyAudio 打开方式如下（内部即采用该配置）：
+```python
+self.stream = self.audio.open(
+    format=pyaudio.paInt16,
+    channels=1,
+    rate=44100,
+    input=True,
+    frames_per_buffer=2048)
+```
+
 ### 参数说明
 
 #### drone_denoiser.py 参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--input` | str | 必需 | 输入音频文件或目录路径 |
+| `--input` | str | - | 输入音频文件或目录路径（非流式） |
 | `--output` | str | 必需 | 输出文件或目录路径 |
 | `--noise-dir` | str | `noise_samples/segments` | 噪声样本目录 |
 | `--batch` | flag | False | 启用批量处理模式 |
 | `--pattern` | str | `*.mp3` | 批量处理的文件匹配模式 |
 | `--top-k` | int | 5 | 选择前K个最匹配的噪声样本 |
 | `--similarity-threshold` | float | 0.75 | 噪声匹配相似度阈值 |
+| `--stream` | flag | False | 使用麦克风音频流作为输入 |
+| `--stream-rate` | int | 44100 | 麦克风采样率 |
+| `--chunk-size` | int | 2048 | 每次读取帧数 |
+| `--channels` | int | 1 | 输入声道数（仅支持1） |
+| `--device-index` | int | None | 输入设备索引 |
+| `--stream-seconds` | int | 60 | 流式处理时长（秒），None 为持续 |
 
 #### extract_drone_noise.py 参数
 
@@ -241,6 +269,9 @@ class DroneVoiceDenoiser:
     
     def multi_stage_denoise(self, y, sr, return_stages=False):
         """多阶段降噪处理核心算法"""
+
+    def process_stream(self, output_file, device_index=None, input_rate=44100, channels=1, chunk_size=2048, stream_seconds=None):
+        """实时音频流降噪并写出"""
 ```
 
 ### DroneNoiseExtractor 类
@@ -287,6 +318,13 @@ class DroneNoiseExtractor:
    ```python
    # 降低相似度阈值
    denoiser.similarity_threshold = 0.6  # 从0.75降低到0.6
+   ```
+
+3. **安装 PyAudio 失败（macOS）**
+   ```bash
+   # 先安装 PortAudio，再安装 PyAudio
+   brew install portaudio
+   pip install pyaudio
    ```
 
 ### 调试模式

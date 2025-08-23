@@ -46,6 +46,7 @@ from sklearn.preprocessing import StandardScaler
 from scipy.spatial.distance import cosine
 import warnings
 warnings.filterwarnings('ignore')
+import time
 
 # 配置matplotlib中文字体支持
 # 解决中文字符在图表中的显示问题
@@ -123,8 +124,8 @@ class DroneVoiceDenoiser:
         
         # === 音频处理核心参数 ===
         self.sample_rate = 22050  # 统一采样率，平衡音质和处理效率
-        self.chunk_duration = 30  # 分片长度（秒），影响内存使用和处理精度
-        self.overlap_duration = 5  # 重叠长度（秒），确保分片边界无缝衔接
+        self.chunk_duration = 20  # 分片长度（秒），影响内存使用和处理精度
+        self.overlap_duration = 3  # 重叠长度（秒），确保分片边界无缝衔接
         
         # === 噪声匹配参数 ===
         self.top_k_noise = top_k_noise  # Top-K噪声样本选择策略
@@ -334,7 +335,7 @@ class DroneVoiceDenoiser:
                 correlation = 0
             
             # 组合相似度得分
-            combined_similarity = (0.4 * cosine_sim + 0.3 * euclidean_sim + 0.3 * abs(correlation))
+            combined_similarity = (0.5 * cosine_sim + 0.15 * euclidean_sim + 0.35 * abs(correlation))
             
             similarities.append({
                 'similarity': combined_similarity,
@@ -712,6 +713,90 @@ class DroneVoiceDenoiser:
         
         return final_audio
     
+    def process_stream(self, output_file, device_index=None, input_rate=44100, channels=1, chunk_size=2048, stream_seconds=None):
+        """
+        处理实时音频流（麦克风），将降噪后的结果按块写入输出文件。
+
+        Args:
+            output_file (str | Path): 输出文件路径（将连续写入）
+            device_index (int | None): 输入设备索引，None 为默认设备
+            input_rate (int): 采样率（输入流采样率）
+            channels (int): 声道数（目前仅支持单声道=1）
+            chunk_size (int): 每次从输入流读取的帧数（越大延迟越高）
+            stream_seconds (int | None): 录制与处理的总时长（秒）；None 表示持续直到中断
+        """
+        try:
+            import pyaudio
+        except ImportError:
+            raise ImportError("未安装 pyaudio，请先运行: pip install pyaudio")
+
+        if channels != 1:
+            raise ValueError("当前版本仅支持单声道（channels=1）")
+
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        audio = pyaudio.PyAudio()
+        stream = audio.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=input_rate,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=chunk_size
+        )
+
+        print("🎤 开始从麦克风读取音频流... 按 Ctrl+C 结束")
+        print(f"  输入设备: {device_index if device_index is not None else '默认'} | 采样率: {input_rate} | chunk: {chunk_size}")
+
+        # 按块写入降噪结果
+        out_file = sf.SoundFile(str(output_path), mode='w', samplerate=self.sample_rate, channels=1, subtype='PCM_16')
+
+        # 缓冲区（以输入采样率计数）
+        buffer_float = np.array([], dtype=np.float32)
+        samples_per_block = int(self.chunk_duration * input_rate)
+        started_at = time.time()
+
+        try:
+            while True:
+                data = stream.read(chunk_size, exception_on_overflow=False)
+                pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                buffer_float = np.concatenate([buffer_float, pcm])
+
+                # 达到一个处理块或到达时长
+                time_up = (stream_seconds is not None) and ((time.time() - started_at) >= stream_seconds)
+                if len(buffer_float) >= samples_per_block or (time_up and len(buffer_float) > 0):
+                    block = buffer_float[:samples_per_block] if len(buffer_float) >= samples_per_block else buffer_float
+                    buffer_float = buffer_float[samples_per_block:] if len(buffer_float) >= samples_per_block else np.array([], dtype=np.float32)
+
+                    # 重采样至内部处理采样率
+                    if input_rate != self.sample_rate:
+                        block = librosa.resample(block, orig_sr=input_rate, target_sr=self.sample_rate)
+
+                    # 降噪
+                    denoised = self.multi_stage_denoise(block, self.sample_rate)
+
+                    # 写出
+                    out_file.write(denoised)
+
+                    if time_up and len(buffer_float) == 0:
+                        break
+        except KeyboardInterrupt:
+            print("\n⏹️ 已停止音频流处理")
+        finally:
+            try:
+                stream.stop_stream()
+                stream.close()
+                audio.terminate()
+            except Exception:
+                pass
+            try:
+                out_file.close()
+            except Exception:
+                pass
+
+        print(f"✓ 流式降噪完成，结果保存至: {output_path}")
+    
     def reconstruct_audio(self, processed_chunks, total_length, overlap_samples):
         """
         重组分片处理后的音频
@@ -1012,46 +1097,66 @@ def main():
                                 --top-k 8 --similarity-threshold 0.8
     """
     parser = argparse.ArgumentParser(description='无人机录音智能降噪系统 - 专业级音频降噪解决方案')
-    parser.add_argument('--input', required=True, help='输入音频文件或目录')
-    parser.add_argument('--output', required=True, help='输出文件或目录')
+    parser.add_argument('--input', required=False, help='输入音频文件或目录（文件模式）')
+    parser.add_argument('--output', required=False, help='输出文件或目录（必需：文件/批量/流模式）')
     parser.add_argument('--noise-dir', default='noise_samples/segments', help='噪声样本目录')
     parser.add_argument('--batch', action='store_true', help='批量处理模式')
     parser.add_argument('--pattern', default='*.mp3', help='批量处理时的文件匹配模式')
     parser.add_argument('--top-k', type=int, default=5, help='选择前k个最匹配的噪声样本进行平均（默认：5）')
     parser.add_argument('--similarity-threshold', type=float, default=0.75, help='相似度阈值，只有超过此值的样本才会被选择（默认：0.75）')
-    
+
+    # 流式相关参数
+    parser.add_argument('--stream', action='store_true', help='启用音频流（麦克风）输入模式')
+    parser.add_argument('--stream-rate', type=int, default=44100, help='麦克风输入采样率（默认：44100）')
+    parser.add_argument('--chunk-size', type=int, default=2048, help='PyAudio 每次读取帧数（默认：2048）')
+    parser.add_argument('--channels', type=int, default=1, help='输入声道数（仅支持1）')
+    parser.add_argument('--device-index', type=int, default=None, help='输入设备索引（默认：None）')
+    parser.add_argument('--stream-seconds', type=int, default=60, help='流式处理持续时长（秒），默认60，None为持续直到中断')
+
     args = parser.parse_args()
-    
+
     # 验证输入输出参数
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-    
-    if args.batch:
-        # 批量模式：输入必须是目录，输出必须是目录
-        if not input_path.is_dir():
-            print(f"错误：批量模式下输入必须是目录，但 {args.input} 不是目录")
+    input_path = Path(args.input) if args.input else None
+    output_path = Path(args.output) if args.output else None
+
+    if args.stream:
+        # 流式模式：必须提供输出文件
+        if output_path is None:
+            print("错误：流式模式必须提供 --output 输出文件路径 (如: out_stream.wav)")
             return
-        # 输出路径可以不存在（会自动创建），但如果存在必须是目录
-        if output_path.exists() and not output_path.is_dir():
-            print(f"错误：批量模式下输出必须是目录，但 {args.output} 不是目录")
+        # 不允许与批量同时
+        if args.batch:
+            print("错误：--stream 模式与 --batch 不能同时使用")
             return
     else:
-        # 单文件模式：输入必须是文件，输出必须是文件路径
-        if not input_path.is_file():
-            print(f"错误：单文件模式下输入必须是文件，但 {args.input} 不是文件")
+        # 非流式：需要 --input 与 --output
+        if input_path is None or output_path is None:
+            print("错误：文件/批量模式需要同时提供 --input 与 --output")
             return
-        # 输出路径如果存在，必须是文件；如果不存在，其父目录必须存在或可以创建
-        if output_path.exists() and output_path.is_dir():
-            print(f"错误：单文件模式下输出必须是文件路径，但 {args.output} 是目录")
-            return
-    
+        if args.batch:
+            # 批量模式：输入必须是目录，输出必须是目录
+            if not input_path.is_dir():
+                print(f"错误：批量模式下输入必须是目录，但 {args.input} 不是目录")
+                return
+            if output_path.exists() and not output_path.is_dir():
+                print(f"错误：批量模式下输出必须是目录，但 {args.output} 不是目录")
+                return
+        else:
+            # 单文件模式：输入必须是文件，输出为文件路径
+            if not input_path.is_file():
+                print(f"错误：单文件模式下输入必须是文件，但 {args.input} 不是文件")
+                return
+            if output_path.exists() and output_path.is_dir():
+                print(f"错误：单文件模式下输出必须是文件路径，但 {args.output} 是目录")
+                return
+
     # 创建降噪器
     denoiser = DroneVoiceDenoiser(
         noise_dir=args.noise_dir,
         top_k_noise=args.top_k,
         similarity_threshold=args.similarity_threshold
     )
-    
+
     # 加载噪声样本
     try:
         denoiser.load_noise_samples()
@@ -1059,17 +1164,26 @@ def main():
         print(f"加载噪声样本失败: {e}")
         print("请确保噪声样本目录存在且包含mp3文件")
         return
-    
+
     # 处理音频
     try:
-        if args.batch:
-            denoiser.batch_process(args.input, args.output, args.pattern)
+        if args.stream:
+            denoiser.process_stream(
+                output_file=str(output_path),
+                device_index=args.device_index,
+                input_rate=args.stream_rate,
+                channels=args.channels,
+                chunk_size=args.chunk_size,
+                stream_seconds=args.stream_seconds if args.stream_seconds is not None else None
+            )
+        elif args.batch:
+            denoiser.batch_process(str(input_path), str(output_path), args.pattern)
         else:
-            denoiser.process_file(args.input, args.output)
+            denoiser.process_file(str(input_path), str(output_path))
     except Exception as e:
         print(f"处理音频失败: {e}")
         return
-    
+
     print("降噪处理完成！")
 
 if __name__ == "__main__":

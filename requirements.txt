@@ -6,3 +6,4 @@ matplotlib>=3.4.0
 seaborn>=0.11.0
 noisereduce>=2.0.0
 scikit-learn>=1.0.0
+pyaudio>=0.2.13
